@@ -16,8 +16,8 @@ import (
 // and return unexpected keys and/or values. You must reposition your cursor
 // after mutating data.
 type Cursor struct {
-	bucket *Bucket
-	stack  []elemRef
+	bucket *Bucket   // 一个 Cursor 隶属于一个 Bucket
+	stack  []elemRef // 保存遍历搜索的路径
 }
 
 // Bucket returns the bucket that this cursor was created from.
@@ -30,6 +30,7 @@ func (c *Cursor) Bucket() *Bucket {
 // The returned key and value are only valid for the life of the transaction.
 func (c *Cursor) First() (key []byte, value []byte) {
 	_assert(c.bucket.tx.db != nil, "tx closed")
+	// 清空 stack
 	c.stack = c.stack[:0]
 	p, n := c.bucket.pageNode(c.bucket.root)
 	c.stack = append(c.stack, elemRef{page: p, node: n, index: 0})
@@ -118,6 +119,8 @@ func (c *Cursor) Seek(seek []byte) (key []byte, value []byte) {
 	k, v, flags := c.seek(seek)
 
 	// If we ended up after the last element of a page then move to the next one.
+	// 下面这一段逻辑是必须的，因为在 seek() 方法中，如果 ref.index>ref.count() 的话，就直接返回 nil,nil,0 了
+	// 这里需要返回下一个
 	if ref := &c.stack[len(c.stack)-1]; ref.index >= ref.count() {
 		k, v, flags = c.next()
 	}
@@ -125,6 +128,7 @@ func (c *Cursor) Seek(seek []byte) (key []byte, value []byte) {
 	if k == nil {
 		return nil, nil
 	} else if (flags & uint32(bucketLeafFlag)) != 0 {
+		// 子桶的话
 		return k, nil
 	}
 	return k, v
@@ -155,8 +159,10 @@ func (c *Cursor) seek(seek []byte) (key []byte, value []byte, flags uint32) {
 	_assert(c.bucket.tx.db != nil, "tx closed")
 
 	// Start from root page/node and traverse to correct page.
-	c.stack = c.stack[:0]
-	c.search(seek, c.bucket.root)
+	c.stack = c.stack[:0] // 重置搜索路径
+	// 开始根据 seek 的 key 值搜索 root
+	c.search(seek, c.bucket.root) // 注意这里传入的是 root page
+	// 执行完搜索后，stack 中保存了所遍历的路径
 	ref := &c.stack[len(c.stack)-1]
 
 	// If the cursor is pointing to the end of page/node then return nil.
@@ -165,6 +171,7 @@ func (c *Cursor) seek(seek []byte) (key []byte, value []byte, flags uint32) {
 	}
 
 	// If this is a bucket then return a nil value.
+	// 获取值
 	return c.keyValue()
 }
 
@@ -249,30 +256,38 @@ func (c *Cursor) next() (key []byte, value []byte, flags uint32) {
 	}
 }
 
+// 从根节点开始遍历
 // search recursively performs a binary search against a given page/node until it finds a given key.
 func (c *Cursor) search(key []byte, pgid pgid) {
-	p, n := c.bucket.pageNode(pgid)
+	// 层层找 page，bucket->tx->db->dataref
+	p, n := c.bucket.pageNode(pgid) // 根据 page id 得到对应的 node 节点
 	if p != nil && (p.flags&(branchPageFlag|leafPageFlag)) == 0 {
 		panic(fmt.Sprintf("invalid page type: %d: %x", p.id, p.flags))
 	}
+	// 将 page 以及 node 封装为 elemRef
 	e := elemRef{page: p, node: n}
+	// 记录遍历过的路径
 	c.stack = append(c.stack, e)
 
 	// If we're on a leaf page/node then find the specific node.
+	// 如果是叶子节点，找具体的值 node，这里实际上也是递归的退出条件
 	if e.isLeaf() {
 		c.nsearch(key)
 		return
 	}
 
 	if n != nil {
+		// 先搜索 node，因为 node 是加载到内存中的
 		c.searchNode(key, n)
 		return
 	}
+	// 其次再在 page 中搜索
 	c.searchPage(key, p)
 }
 
 func (c *Cursor) searchNode(key []byte, n *node) {
 	var exact bool
+	// 二分搜索
 	index := sort.Search(len(n.inodes), func(i int) bool {
 		// TODO(benbjohnson): Optimize this range search. It's a bit hacky right now.
 		// sort.Search() finds the lowest index where f() != -1 but we need the highest index.
@@ -286,11 +301,12 @@ func (c *Cursor) searchNode(key []byte, n *node) {
 		index--
 	}
 	c.stack[len(c.stack)-1].index = index
-
+	// 递归
 	// Recursively search to the next page.
 	c.search(key, n.inodes[index].pgid)
 }
 
+// 页中搜索
 func (c *Cursor) searchPage(key []byte, p *page) {
 	// Binary search for the correct range.
 	inodes := p.branchPageElements()
@@ -315,12 +331,15 @@ func (c *Cursor) searchPage(key []byte, p *page) {
 }
 
 // nsearch searches the leaf node on the top of the stack for a key.
+// 搜索叶子页
 func (c *Cursor) nsearch(key []byte) {
 	e := &c.stack[len(c.stack)-1]
 	p, n := e.page, e.node
 
 	// If we have a node then search its inodes.
+	// 优先搜索 node
 	if n != nil {
+		// 又是二分搜索
 		index := sort.Search(len(n.inodes), func(i int) bool {
 			return bytes.Compare(n.inodes[i].key, key) != -1
 		})
@@ -329,7 +348,8 @@ func (c *Cursor) nsearch(key []byte) {
 	}
 
 	// If we have a page then search its leaf elements.
-	inodes := p.leafPageElements()
+	// node 为 nil，选择搜索 page
+	inodes := p.leafPageElements() // 后续我们根据 leafPageElements.key 方法来得到 key
 	index := sort.Search(int(p.count), func(i int) bool {
 		return bytes.Compare(inodes[i].key(), key) != -1
 	})
@@ -338,17 +358,19 @@ func (c *Cursor) nsearch(key []byte) {
 
 // keyValue returns the key and value of the current leaf element.
 func (c *Cursor) keyValue() ([]byte, []byte, uint32) {
+	// 最后一个节点为叶子节点
 	ref := &c.stack[len(c.stack)-1]
 	if ref.count() == 0 || ref.index >= ref.count() {
 		return nil, nil, 0
 	}
 
 	// Retrieve value from node.
+	// 先从内存中取
 	if ref.node != nil {
 		inode := &ref.node.inodes[ref.index]
 		return inode.key, inode.value, inode.flags
 	}
-
+	// 其次再从文件 page 中取
 	// Or retrieve value from page.
 	elem := ref.page.leafPageElement(uint16(ref.index))
 	return elem.key(), elem.value(), elem.flags

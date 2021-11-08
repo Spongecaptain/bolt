@@ -177,7 +177,7 @@ func (f *freelist) read(p *page) {
 		f.ids = make([]pgid, len(ids))
 		copy(f.ids, ids)
 
-		// Make sure they're sorted.
+		// Make sure they're `sorted`.
 		sort.Sort(pgids(f.ids))
 	}
 

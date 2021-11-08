@@ -11,6 +11,9 @@ import (
 )
 
 // flock acquires an advisory lock on a file descriptor.
+// mode 参数完全没用到
+// 自旋超时锁的设计，当 timeout <= 0，意味着关闭超时机制
+// Linux flock 系统调用可以参考：https://zhuanlan.zhihu.com/p/25134841
 func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) error {
 	var t time.Time
 	for {
@@ -21,13 +24,13 @@ func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) erro
 		} else if timeout > 0 && time.Since(t) > timeout {
 			return ErrTimeout
 		}
-		flag := syscall.LOCK_SH
+		flag := syscall.LOCK_SH // 共享锁
 		if exclusive {
-			flag = syscall.LOCK_EX
+			flag = syscall.LOCK_EX // 互斥(独占)锁
 		}
-
+		// 这是一个系统调用
 		// Otherwise attempt to obtain an exclusive lock.
-		err := syscall.Flock(int(db.file.Fd()), flag|syscall.LOCK_NB)
+		err := syscall.Flock(int(db.file.Fd()), flag|syscall.LOCK_NB) // LOCK_NB 意味着 none-blocking，即非阻塞
 		if err == nil {
 			return nil
 		} else if err != syscall.EWOULDBLOCK {
